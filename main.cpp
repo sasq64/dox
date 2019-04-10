@@ -1,4 +1,5 @@
 #include <coreutils/file.h>
+#include <coreutils/utils.h>
 
 #include <clang-c/CXCompilationDatabase.h>
 #include <clang-c/Index.h>
@@ -12,6 +13,14 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+using namespace std::string_literals;
+
+struct parser_exception : public std::exception
+{
+    parser_exception(std::string const& msg) : message(msg) {}
+    std::string message;
+};
 
 std::ostream& operator<<(std::ostream& stream, const CXString& str)
 {
@@ -44,9 +53,10 @@ std::string resolvePath(const char* path)
     return resolvedPath;
 }
 
-void doSomething() {}
-
 namespace hey {
+
+struct SomeType
+{};
 
 class MyClass
 {
@@ -54,9 +64,9 @@ class MyClass
     void fn() { val = ""; }
 
 public:
-    int doSomething(std::string const& arg)
+    double doSomething(SomeType const& arg)
     {
-        val = arg;
+        // val = arg;
         return 2;
     }
 };
@@ -125,10 +135,171 @@ struct Class
     std::vector<Var> fields;
 };
 
-std::unordered_map<std::string, Class> classes;
+class CppParser
+{
+    std::string project_dir_;
+    CXCompilationDatabase compilation_database_;
+    CXIndex index_;
+    CXTranslationUnit translation_unit_;
+
+    std::vector<std::string> args_;
+    std::unordered_map<std::string, Class> classes;
+    std::vector<std::string> ns;
+    std::string className;
+    CX_CXXAccessSpecifier access = CX_CXXAccessSpecifier::CX_CXXPrivate;
+
+public:
+    CppParser(std::string const& project_dir) : project_dir_(project_dir)
+    {
+
+        index_ = clang_createIndex(0, 0);
+        CXCompilationDatabase_Error cderror;
+        compilation_database_ = clang_CompilationDatabase_fromDirectory(
+            project_dir.c_str(), &cderror);
+        if (cderror != 0)
+            throw parser_exception("Could not load compilation database");
+    }
+
+    void load(std::string const& source_file)
+    {
+        std::cout << source_file << "\n";
+        auto resolvedPath = resolvePath(source_file.c_str());
+
+        auto compile_commands = clang_CompilationDatabase_getCompileCommands(
+            compilation_database_, resolvedPath.c_str());
+        auto num_commands = clang_CompileCommands_getSize(compile_commands);
+        if (num_commands != 1)
+            throw parser_exception("Expected exactly one compilation command");
+
+        auto command = clang_CompileCommands_getCommand(compile_commands, 0);
+        auto numArgs = clang_CompileCommand_getNumArgs(command);
+        fmt::print("{} args\n", numArgs);
+        for (auto i = 0; i < numArgs; i++) {
+            CXString argument = clang_CompileCommand_getArg(command, i);
+            args_.push_back(clang_getCString(argument));
+            clang_disposeString(argument);
+        }
+        fmt::print("Transforming\n");
+        std::vector<const char*> argArray;
+        std::transform(args_.begin(), args_.end(), std::back_inserter(argArray),
+                       [](auto const& c) { return c.c_str(); });
+
+        translation_unit_ = clang_parseTranslationUnit(
+            index_, 0, argArray.data(), numArgs, 0, 0, CXTranslationUnit_None);
+    }
+
+    CXChildVisitResult method_visitor(CXCursor c, CXCursor parent)
+    {
+        int nsLevel = ns.size() * 4;
+        auto kind = clang_getCursorKind(c);
+        const char* cs = clang_getCString(clang_getCursorSpelling(c));
+        std::string name = cs;
+        const char* ks = clang_getCString(clang_getCursorKindSpelling(kind));
+        int argCount = clang_Cursor_getNumArguments(c);
+        auto t = clang_getCursorType(c);
+        int fArgs = clang_getNumArgTypes(t);
+        int nArgs = clang_Cursor_getNumArguments(c);
+        std::string typeName;
+        std::string extra;
+        if (nArgs >= 1) {
+            // auto aType = clang_getArgType(t, 0);
+            // CXString typeSpelling = clang_getTypeSpelling(aType);
+            // const char* ts = clang_getCString(typeSpelling);
+            // typeName = ts;
+
+            auto argCursor = clang_Cursor_getArgument(c, 0);
+            if (clang_Cursor_isNull(argCursor)) {
+                extra = "null";
+            } else if (clang_isInvalidDeclaration(c)) {
+                extra = "invalid";
+            } else {
+                const char* as =
+                    clang_getCString(clang_getCursorSpelling(argCursor));
+                extra = as;
+            }
+        }
+        fmt::print("{}{} ({}) {} {} {} {}\n", utils::indent("", nsLevel), name,
+                   ks, argCount, fArgs, typeName, extra);
+        if (kind == CXCursorKind::CXCursor_CXXMethod) {
+            fmt::print("{}()\n", utils::indent(name, nsLevel));
+            int argCount = clang_Cursor_getNumArguments(c);
+            CXType type = clang_getCursorType(c);
+            for (int i = 0; i < argCount; i++) {
+
+                auto aType = clang_getArgType(type, i);
+                auto argCursor = clang_Cursor_getArgument(c, i);
+                const char* cs =
+                    clang_getCString(clang_getCursorSpelling(argCursor));
+                std::string name = cs;
+                CXString typeSpelling = clang_getTypeSpelling(aType);
+                const char* ts = clang_getCString(typeSpelling);
+                fmt::print("{}..\n", utils::indent(name + " : " + ts, nsLevel));
+            }
+        } else if (kind == CXCursorKind::CXCursor_ParmDecl) {
+
+        } else {
+        }
+        return CXChildVisit_Recurse;
+    }
+
+    static CXChildVisitResult static_method_visitor(CXCursor c, CXCursor parent,
+                                                    CXClientData client_data)
+    {
+        auto* thiz = static_cast<CppParser*>(client_data);
+        return thiz->method_visitor(c, parent);
+    }
+
+    CXChildVisitResult visitor(CXCursor c, CXCursor parent)
+    {
+        auto kind = clang_getCursorKind(c);
+        const char* cs = clang_getCString(clang_getCursorSpelling(c));
+        std::string name = cs;
+        int nsLevel = ns.size() * 4;
+        if (kind == CXCursorKind::CXCursor_Namespace) {
+            std::cout << utils::indent(name, nsLevel * 4) << "\n";
+            ns.push_back(name);
+            nsLevel++;
+            clang_visitChildren(c, static_visitor, this);
+            ns.pop_back();
+            nsLevel--;
+        } else if (kind == CXCursorKind::CXCursor_ClassDecl) {
+            access = CX_CXXAccessSpecifier::CX_CXXPrivate;
+            auto nspace = utils::join(ns.begin(), ns.end(), "::"s);
+            className = nspace + "::" + name;
+            classes[className] = Class{nspace, name};
+            std::cout << utils::indent(className, nsLevel * 4) << "\n";
+            clang_visitChildren(c, static_method_visitor, this);
+        } else if (kind == CXCursorKind::CXCursor_StructDecl) {
+            access = CX_CXXAccessSpecifier::CX_CXXPublic;
+        }
+        return CXChildVisit_Continue;
+    }
+
+    static CXChildVisitResult static_visitor(CXCursor c, CXCursor parent,
+                                             CXClientData client_data)
+    {
+        auto* thiz = static_cast<CppParser*>(client_data);
+        return thiz->visitor(c, parent);
+    }
+
+    void traverse()
+    {
+        CXCursor cursor = clang_getTranslationUnitCursor(translation_unit_);
+        static std::string ns = "";
+        static CX_CXXAccessSpecifier access =
+            CX_CXXAccessSpecifier::CX_CXXPrivate;
+        ns.clear();
+        clang_visitChildren(cursor, static_visitor, this);
+    }
+};
 
 int main(int argc, char** argv)
 {
+
+    CppParser parser{"."};
+    parser.load(argv[1]);
+    parser.traverse();
+
 #if 0
     sol::state lua;
 
@@ -143,7 +314,9 @@ int main(int argc, char** argv)
             fmt::print("{}", segment);
         isLua = !isLua;
     }
-#endif
+
+
+
     CXIndex index = clang_createIndex(0, 0);
 
     auto resolvedPath = resolvePath(argv[1]);
@@ -179,7 +352,8 @@ int main(int argc, char** argv)
 
     /* const char* args[] = { */
     /*     "-std=gnu++14", */
-    /*     "-I/opt/clang+llvm-8.0.0-x86_64-linux-gnu-ubuntu-18.04/include"}; */
+    /*     "-I/opt/clang+llvm-8.0.0-x86_64-linux-gnu-ubuntu-18.04/include"};
+     */
     /* CXTranslationUnit unit = clang_parseTranslationUnit( */
     /*     index, argv[1], args, 2, nullptr, 0, CXTranslationUnit_None); */
     /* if (unit == nullptr) { */
@@ -219,9 +393,11 @@ int main(int argc, char** argv)
 
             /* std::cout << "Cursor '" << clang_getCursorSpelling(c) */
             /*           << "' of kind '" */
-            /*           << clang_getCursorKindSpelling(clang_getCursorKind(c))
+            /*           <<
+             * clang_getCursorKindSpelling(clang_getCursorKind(c))
              */
-            /*           << "' inside " << clang_getCursorSpelling(parent) <<
+            /*           << "' inside " << clang_getCursorSpelling(parent)
+             * <<
              * '\n'; */
             return CXChildVisit_Recurse;
         },
@@ -229,6 +405,7 @@ int main(int argc, char** argv)
 
     clang_disposeTranslationUnit(unit);
     clang_disposeIndex(index);
+#endif
     return 0;
 }
 
