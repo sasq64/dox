@@ -1,5 +1,3 @@
-**_This project has moved to https://gitlab.com/eidheim/tiny-process-library._**
-
 # tiny-process-library
 A small platform independent library making it simple to create and stop new processes in C++, as well as writing to stdin and reading from stdout and stderr of a new process.
 
@@ -17,7 +15,7 @@ This library was created for, and is used by the C++ IDE project [juCi++](https:
 * Correctly closes file descriptors/handles
 
 ### Usage
-See [examples.cpp](https://gitlab.com/eidheim/tiny-process-library/blob/master/examples.cpp).
+See [examples.cpp](examples.cpp).
 
 ### Get, compile and run
 
@@ -41,4 +39,31 @@ cd build
 cmake -G"MSYS Makefiles" ..
 make
 ./examples
+```
+
+### Coding style
+Due to poor lambda support in clang-format, a custom clang-format is used with the following patch applied:
+```diff
+diff --git a/lib/Format/ContinuationIndenter.cpp b/lib/Format/ContinuationIndenter.cpp
+index bb8efd61a3..e80a487055 100644
+--- a/lib/Format/ContinuationIndenter.cpp
++++ b/lib/Format/ContinuationIndenter.cpp
+@@ -276,6 +276,8 @@ LineState ContinuationIndenter::getInitialState(unsigned FirstIndent,
+ }
+ 
+ bool ContinuationIndenter::canBreak(const LineState &State) {
++  if(Style.ColumnLimit==0)
++    return true;
+   const FormatToken &Current = *State.NextToken;
+   const FormatToken &Previous = *Current.Previous;
+   assert(&Previous == Current.Previous);
+@@ -325,6 +327,8 @@ bool ContinuationIndenter::canBreak(const LineState &State) {
+ }
+ 
+ bool ContinuationIndenter::mustBreak(const LineState &State) {
++  if(Style.ColumnLimit==0)
++    return false;
+   const FormatToken &Current = *State.NextToken;
+   const FormatToken &Previous = *Current.Previous;
+   if (Current.MustBreakBefore || Current.is(TT_InlineASMColon))
 ```

@@ -1,3 +1,5 @@
+#include "test_api.h"
+
 #include <coreutils/file.h>
 #include <coreutils/utils.h>
 
@@ -28,6 +30,8 @@ struct parser_exception : public std::exception
 };
 
 #ifdef __unix__
+#    include <cppast/cpp_function_template.hpp>
+#    include <cppast/cpp_member_function.hpp>
 #    include <limits.h>
 #    include <stdlib.h>
 #endif
@@ -87,7 +91,7 @@ std::vector<std::string> parse(std::string const& doc)
                     curly = 1;
                 curly--;
                 if (curly == 0) {
-                    segments.push_back(output);
+                    segments.push_back(output.substr(0,output.length()-1));
                     output = "";
                     continue;
                 }
@@ -106,6 +110,9 @@ std::vector<std::string> parse(std::string const& doc)
         }
         output += c;
         lastChar = c;
+    }
+    if(!output.empty()) {
+        segments.push_back(output);
     }
     return segments;
 }
@@ -135,93 +142,66 @@ struct Class
 
 // prints the AST entry of a cpp_entity (base class for all entities),
 // will only print a single line
-void print_entity(std::ostream& out, const cppast::cpp_entity& e)
+std::string print_entity(cppast::cpp_entity const& e)
 {
-    // print name and the kind of the entity
-    if (!e.name().empty())
-        out << e.name();
-    else
-        out << "<anonymous>";
-    out << " (" << cppast::to_string(e.kind()) << ")";
+    // print the declaration of the entity
+    // it will only use a single line
+    // derive from code_generator and implement various callbacks for
+    // printing it will print into a std::string
+    class code_generator : public cppast::code_generator
+    {
+        std::string str_;
+        bool was_newline_ = false;
 
-    // print whether or not it is a definition
-    if (cppast::is_definition(e))
-        out << " [definition]";
-
-    // print number of attributes
-    if (!e.attributes().empty())
-        out << " [" << e.attributes().size() << " attribute(s)]";
-
-    if (e.kind() == cppast::cpp_entity_kind::language_linkage_t)
-        // no need to print additional information for language linkages
-        out << '\n';
-    else if (e.kind() == cppast::cpp_entity_kind::namespace_t) {
-        // cast to cpp_namespace
-        auto& ns = static_cast<const cppast::cpp_namespace&>(e);
-        // print whether or not it is inline
-        if (ns.is_inline())
-            out << " [inline]";
-        out << '\n';
-    } else {
-        // print the declaration of the entity
-        // it will only use a single line
-        // derive from code_generator and implement various callbacks for
-        // printing it will print into a std::string
-        class code_generator : public cppast::code_generator
+    public:
+        explicit code_generator(const cppast::cpp_entity& e)
         {
-            std::string str_; // the result
-            bool was_newline_ =
-                false; // whether or not the last token was a newline
-            // needed for lazily printing them
+            cppast::generate_code(*this, e);
+        }
 
-        public:
-            code_generator(const cppast::cpp_entity& e)
-            {
-                // kickoff code generation here
-                cppast::generate_code(*this, e);
+        // return the result
+        [[nodiscard]] const std::string& str() const noexcept { return str_; }
+
+    private:
+        // called to retrieve the generation options of an entity
+        generation_options
+        do_get_options(const cppast::cpp_entity&,
+                       cppast::cpp_access_specifier_kind) override
+        {
+            // generate declaration only
+            return code_generator::declaration;
+        }
+
+        // no need to handle indentation, as only a single line is used
+        void do_indent() override {}
+        void do_unindent() override {}
+
+        // called when a generic token sequence should be generated
+        // there are specialized callbacks for various token kinds,
+        // to e.g. implement syntax highlighting
+        void do_write_token_seq(cppast::string_view tokens) override
+        {
+            if (was_newline_) {
+                // lazily append newline as space
+                str_ += ' ';
+                was_newline_ = false;
             }
-
-            // return the result
-            const std::string& str() const noexcept { return str_; }
-
-        private:
-            // called to retrieve the generation options of an entity
-            generation_options
-            do_get_options(const cppast::cpp_entity&,
-                           cppast::cpp_access_specifier_kind) override
-            {
-                // generate declaration only
-                return code_generator::declaration;
-            }
-
-            // no need to handle indentation, as only a single line is used
-            void do_indent() override {}
-            void do_unindent() override {}
-
-            // called when a generic token sequence should be generated
-            // there are specialized callbacks for various token kinds,
-            // to e.g. implement syntax highlighting
-            void do_write_token_seq(cppast::string_view tokens) override
-            {
-                if (was_newline_) {
-                    // lazily append newline as space
-                    str_ += ' ';
-                    was_newline_ = false;
-                }
-                // append tokens
+            // append tokens
+            if (";"s != tokens.c_str()) {
                 str_ += tokens.c_str();
             }
+        }
 
-            // called when a newline should be generated
-            // we're lazy as it will always generate a trailing newline,
-            // we don't want
-            void do_write_newline() override { was_newline_ = true; }
+        // called when a newline should be generated
+        // we're lazy as it will always generate a trailing newline,
+        // we don't want
+        void do_write_newline() override { was_newline_ = true; }
 
-        } generator(e);
-        // print generated code
-        out << ": `" << generator.str() << '`' << '\n';
-    }
+    } generator(e);
+    // print generated code
+    return generator.str();
 }
+
 class CppParser
 {
     std::string project_dir_;
@@ -231,7 +211,7 @@ class CppParser
     cppast::libclang_compilation_database database_;
 
 public:
-    CppParser(std::string const& project_dir)
+    explicit CppParser(std::string const& project_dir)
         : project_dir_(project_dir), database_(project_dir)
     {}
 
@@ -253,132 +233,77 @@ public:
         auto file = parser.parse(idx, resolvedPath, config);
         if (parser.error())
             throw parser_exception("Could not parse");
-        cppast::visit(
-            *file, [&](const cppast::cpp_entity& e, cppast::visitor_info info) {
-                if (e.kind() == cppast::cpp_entity_kind::class_t) {
-                    fmt::print("{} : {}\n", e.name(), info.event);
+        cppast::visit(*file, [&](const cppast::cpp_entity& e,
+                                 cppast::visitor_info info) {
+            if (e.kind() == cppast::cpp_entity_kind::class_t) {
+                fmt::print("Found class {} : {}\n", e.name(), info.event);
+            }
+            if (e.kind() == cppast::cpp_entity_kind::function_template_t) {
+
+                fmt::print("Found Template\n");
+                 auto const& tf =
+                  dynamic_cast<cppast::cpp_function_template const&>(e);
+                for (auto const& param : tf.parameters()) {
+                    fmt::print("T: {} : ({})\n", param.name(),
+                               param.comment() ? param.comment().value().c_str() : "");
                 }
-                print_entity(std::cout, e);
-                return true;
-            });
+                cppast::visit(tf, [&](const cppast::cpp_entity& e,
+                                         cppast::visitor_info info) {
+                    fmt::print("T: {} -- {}\n", e.name(), print_entity(e));
+                });
+
+            }
+            if (e.kind() == cppast::cpp_entity_kind::member_function_t) {
+                fmt::print("Found member function\n");
+                auto const& mf =
+                    dynamic_cast<cppast::cpp_member_function const&>(e);
+
+                for (auto const& param : mf.parameters()) {
+                    fmt::print("{} : ({})", param.name(),
+                               param.comment() ? param.comment().value().c_str()
+                                               : "");
+                    cppast::visit(param, [&](const cppast::cpp_entity& e,
+                                             cppast::visitor_info info) {
+                        fmt::print("{} -- {}\n", e.name(), print_entity(e));
+                    });
+                }
+            }
+            if (auto cr = e.comment()) {
+                fmt::print("\n{}\n", cr.value());
+            }
+            fmt::print("[{}] {}\n", (int)e.kind(), print_entity(e));
+            return true;
+        });
     }
-
-    void test1(size_t abc) {}
-
-    void test2(std::thread const& cde) {}
-    void test3(std::vector<int> const& fgh) {}
 };
 
 int main(int argc, char** argv)
 {
 
-    CppParser parser{"."};
-    parser.load(argv[1]);
-
+    std::string currDir = ".";
     sol::state lua;
 
     lua["print"] = [](std::string const& text) { std::cout << text; };
 
+    lua["set_dir"] = [&](std::string const& fn) {
+        currDir = fn;
+    };
+
+    lua["load_source"] = [&](std::string const& fn) {
+        auto parser = std::make_shared<CppParser>(currDir);
+        parser->load(fn);
+        return parser;
+    };
+
     auto res = parse(utils::File{argv[1]}.readAll());
     bool isLua = false;
-    for (auto segment : res) {
+    for (auto const& segment : res) {
         if (isLua) {
             lua.script(segment);
         } else
-            fmt::print("{}", segment);
+            std::cout << segment;
         isLua = !isLua;
     }
 
-#if 0
-    CXIndex index = clang_createIndex(0, 0);
-
-    auto resolvedPath = resolvePath(argv[1]);
-
-    CXCompilationDatabase_Error compilationDatabaseError;
-    CXCompilationDatabase compilationDatabase =
-        clang_CompilationDatabase_fromDirectory(".", &compilationDatabaseError);
-    CXCompileCommands compileCommands =
-        clang_CompilationDatabase_getCompileCommands(compilationDatabase,
-                                                     resolvedPath.c_str());
-    unsigned int numCompileCommands =
-        clang_CompileCommands_getSize(compileCommands);
-
-    CXCompileCommand compileCommand =
-        clang_CompileCommands_getCommand(compileCommands, 0);
-    unsigned int numArguments = clang_CompileCommand_getNumArgs(compileCommand);
-    char** arguments = new char*[numArguments];
-
-    for (unsigned int i = 0; i < numArguments; i++) {
-        CXString argument = clang_CompileCommand_getArg(compileCommand, i);
-        std::string strArgument = clang_getCString(argument);
-        arguments[i] = new char[strArgument.size() + 1];
-
-        std::fill(arguments[i], arguments[i] + strArgument.size() + 1, 0);
-
-        std::copy(strArgument.begin(), strArgument.end(), arguments[i]);
-
-        clang_disposeString(argument);
-    }
-
-    auto unit = clang_parseTranslationUnit(index, 0, arguments, numArguments, 0,
-                                           0, CXTranslationUnit_None);
-
-    /* const char* args[] = { */
-    /*     "-std=gnu++14", */
-    /*     "-I/opt/clang+llvm-8.0.0-x86_64-linux-gnu-ubuntu-18.04/include"};
-     */
-    /* CXTranslationUnit unit = clang_parseTranslationUnit( */
-    /*     index, argv[1], args, 2, nullptr, 0, CXTranslationUnit_None); */
-    /* if (unit == nullptr) { */
-    /*     std::cerr << "Unable to parse translation unit. Quitting." <<
-     * std::endl; */
-    /*     exit(-1); */
-    /* } */
-
-    CXCursor cursor = clang_getTranslationUnitCursor(unit);
-    static std::string ns = "";
-    static CX_CXXAccessSpecifier access = CX_CXXAccessSpecifier::CX_CXXPrivate;
-    clang_visitChildren(
-        cursor,
-        [](CXCursor c, CXCursor parent, CXClientData client_data) {
-            auto kind = clang_getCursorKind(c);
-            const char* cs = clang_getCString(clang_getCursorSpelling(c));
-            std::string name = cs;
-            if (kind == CXCursorKind::CXCursor_CXXAccessSpecifier) {
-                access = clang_getCXXAccessSpecifier(c);
-                if (access == CX_CXXAccessSpecifier::CX_CXXPublic) {
-                    std::cout << "public\n";
-                } else {
-                    std::cout << "private/protected\n";
-                }
-            }
-            if (kind == CXCursorKind::CXCursor_Namespace) {
-                std::cout << "namespace " << name << "\n";
-            } else if (kind == CXCursorKind::CXCursor_ClassDecl) {
-                access = CX_CXXAccessSpecifier::CX_CXXPrivate;
-                classes[ns + name] = Class{ns, name};
-                std::cout << "class " << name << "\n";
-            } else if (kind == CXCursorKind::CXCursor_StructDecl) {
-                access = CX_CXXAccessSpecifier::CX_CXXPublic;
-                classes[ns + name] = Class{ns, name};
-                std::cout << "struct " << name << "\n";
-            }
-
-            /* std::cout << "Cursor '" << clang_getCursorSpelling(c) */
-            /*           << "' of kind '" */
-            /*           <<
-             * clang_getCursorKindSpelling(clang_getCursorKind(c))
-             */
-            /*           << "' inside " << clang_getCursorSpelling(parent)
-             * <<
-             * '\n'; */
-            return CXChildVisit_Recurse;
-        },
-        nullptr);
-
-    clang_disposeTranslationUnit(unit);
-    clang_disposeIndex(index);
-#endif
     return 0;
 }
-
